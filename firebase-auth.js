@@ -1,3 +1,8 @@
+// =====================================================
+// Vetaris CRM - Firebase Auth & Sync
+// Wersja: 2.0 (poprawiona)
+// =====================================================
+
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import {
   getAuth,
@@ -5,7 +10,8 @@ import {
   browserLocalPersistence,
   onAuthStateChanged,
   signInWithEmailAndPassword,
-  signOut
+  signOut,
+  sendPasswordResetEmail
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
   getFirestore,
@@ -15,13 +21,15 @@ import {
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
+// ⚠️ UWAGA: SPRAWDŹ TE WARTOŚCI W FIREBASE CONSOLE!
+// appId i messagingSenderId muszą mieć ten sam numer projektu na początku
 const firebaseConfig = {
   apiKey: "AIzaSyCZjBZFwehf8Dyt7S4JaEavUnbvbKl34vY",
   authDomain: "vetaris-6b17b.firebaseapp.com",
   projectId: "vetaris-6b17b",
   storageBucket: "vetaris-6b17b.firebasestorage.app",
   messagingSenderId: "204148824314",
-  appId: "1:264148824314:web:eba6b1cbbfc81b9cd89943",
+  appId: "1:204148824314:web:eba6b1cbbfc81b9cd89943", // ← POPRAWIONE (było 264...)
   measurementId: "G-26MMF7HNXW"
 };
 
@@ -30,17 +38,23 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 auth.languageCode = "pl";
 
+// === Elementy DOM ===
 const screen = document.getElementById("auth-screen");
 const form = document.getElementById("auth-form");
 const emailInput = document.getElementById("auth-email");
 const passInput = document.getElementById("auth-password");
 const errorBox = document.getElementById("auth-error");
 const submitBtn = document.getElementById("auth-submit");
+const resetBtn = document.getElementById("auth-reset");
+
 let unsubscribeCrm = null;
 let crmDocRef = null;
 let firstCloudSnapshot = true;
 let saveChain = Promise.resolve();
+let retryCount = 0;
+const MAX_RETRIES = 3;
 
+// === Status synchronizacji ===
 function setSyncStatus(text, mode = "idle") {
   let badge = document.getElementById("sync-status");
   const topbar = document.querySelector(".topbar");
@@ -74,20 +88,34 @@ function showError(message) {
   errorBox.style.display = message ? "block" : "none";
 }
 
+function showInfo(message) {
+  if (!errorBox) return;
+  errorBox.textContent = message || "";
+  errorBox.style.display = message ? "block" : "none";
+  errorBox.style.background = "#dcfce7";
+  errorBox.style.color = "#166534";
+  setTimeout(() => {
+    errorBox.style.background = "";
+    errorBox.style.color = "";
+  }, 5000);
+}
+
 function authMessage(code) {
   const map = {
     "auth/invalid-email": "Nieprawidłowy adres email.",
-    "auth/user-disabled": "To konto jest zablokowane.",
-    "auth/user-not-found": "Nie ma takiego użytkownika w Firebase.",
+    "auth/user-disabled": "To konto jest zablokowane. Skontaktuj się z administratorem.",
+    "auth/user-not-found": "Nie ma takiego użytkownika. Poproś administratora o dodanie konta.",
     "auth/wrong-password": "Nieprawidłowe hasło.",
     "auth/invalid-credential": "Nieprawidłowy email lub hasło.",
-    "auth/too-many-requests": "Za dużo prób logowania. Spróbuj później.",
-    "auth/network-request-failed": "Problem z połączeniem internetowym.",
-    "auth/unauthorized-domain": "Ta domena nie jest dodana w Firebase Authorized domains."
+    "auth/too-many-requests": "Za dużo prób logowania. Spróbuj za kilka minut.",
+    "auth/network-request-failed": "Brak połączenia z internetem.",
+    "auth/unauthorized-domain": "Ta domena nie jest dodana w Firebase Authorized domains.",
+    "auth/missing-password": "Wpisz hasło."
   };
   return map[code] || "Nie udało się zalogować. Sprawdź email i hasło.";
 }
 
+// === Przycisk wylogowania ===
 function addLogout(user) {
   const topbar = document.querySelector(".topbar");
   if (!topbar || document.getElementById("auth-logout")) return;
@@ -101,10 +129,15 @@ function addLogout(user) {
   btn.type = "button";
   btn.textContent = "Wyloguj";
   btn.style.marginLeft = "10px";
-  btn.addEventListener("click", () => signOut(auth));
+  btn.addEventListener("click", async () => {
+    if (confirm("Czy na pewno chcesz się wylogować?")) {
+      await signOut(auth);
+    }
+  });
   topbar.appendChild(btn);
 }
 
+// === Stop synchronizacji ===
 function stopFirestoreSync() {
   if (unsubscribeCrm) {
     unsubscribeCrm();
@@ -112,8 +145,10 @@ function stopFirestoreSync() {
   }
   crmDocRef = null;
   window.vetarisCloudSave = null;
+  retryCount = 0;
 }
 
+// === Start synchronizacji ===
 function startFirestoreSync(user) {
   stopFirestoreSync();
   firstCloudSnapshot = true;
@@ -123,6 +158,7 @@ function startFirestoreSync(user) {
   window.vetarisCloudSave = (data) => {
     if (!crmDocRef || !data) return;
     const updatedAtClient = Number(localStorage.getItem("vetaris_crm_v2_updated_at")) || Date.now();
+    
     saveChain = saveChain.then(async () => {
       try {
         setSyncStatus("Zapisywanie w chmurze...", "saving");
@@ -133,9 +169,16 @@ function startFirestoreSync(user) {
           updatedBy: user.email || user.uid
         }, { merge: true });
         setSyncStatus("Zapisano w chmurze", "ok");
+        retryCount = 0;
       } catch (error) {
         console.error("Firestore save error", error);
-        setSyncStatus("Błąd zapisu Firestore", "error");
+        retryCount++;
+        if (retryCount < MAX_RETRIES) {
+          setSyncStatus(`Ponawiam zapis (${retryCount}/${MAX_RETRIES})...`, "saving");
+          await new Promise(r => setTimeout(r, 2000 * retryCount));
+          return window.vetarisCloudSave(data);
+        }
+        setSyncStatus("Błąd zapisu - zapisuję lokalnie", "error");
       }
     });
     return saveChain;
@@ -152,22 +195,22 @@ function startFirestoreSync(user) {
             fromCache: snapshot.metadata.fromCache
           });
         }
-        setSyncStatus(snapshot.metadata.fromCache ? "Dane z cache Firestore" : "Połączono z Firestore", "ok");
+        setSyncStatus(snapshot.metadata.fromCache ? "Dane z cache" : "Połączono z Firestore", "ok");
       } else if (firstCloudSnapshot && typeof window.vetarisGetDB === "function") {
-        setSyncStatus("Tworzę bazę w Firestore...", "saving");
+        setSyncStatus("Tworzę bazę...", "saving");
         await setDoc(crmDocRef, {
           data: window.vetarisGetDB(),
-          updatedAtClient: Number(localStorage.getItem("vetaris_crm_v2_updated_at")) || Date.now(),
+          updatedAtClient: Date.now(),
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
           updatedBy: user.email || user.uid
         });
-        setSyncStatus("Baza Firestore utworzona", "ok");
+        setSyncStatus("Baza utworzona", "ok");
       }
       firstCloudSnapshot = false;
     } catch (error) {
       console.error("Firestore sync error", error);
-      setSyncStatus("Błąd synchronizacji Firestore", "error");
+      setSyncStatus("Błąd synchronizacji", "error");
     }
   }, (error) => {
     console.error("Firestore snapshot error", error);
@@ -175,18 +218,30 @@ function startFirestoreSync(user) {
   });
 }
 
+// === Persistence ===
 setPersistence(auth, browserLocalPersistence).catch(() => {});
 
+// === Obsługa formularza ===
 if (form) {
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     showError("");
+    
+    const email = emailInput.value.trim();
+    const pass = passInput.value;
+    
+    if (!email || !pass) {
+      showError("Wpisz email i hasło.");
+      return;
+    }
+    
     if (submitBtn) {
       submitBtn.disabled = true;
       submitBtn.textContent = "Logowanie...";
     }
+    
     try {
-      await signInWithEmailAndPassword(auth, emailInput.value.trim(), passInput.value);
+      await signInWithEmailAndPassword(auth, email, pass);
     } catch (error) {
       showError(authMessage(error.code));
     } finally {
@@ -198,6 +253,26 @@ if (form) {
   });
 }
 
+// === Reset hasła ===
+if (resetBtn) {
+  resetBtn.addEventListener("click", async (e) => {
+    e.preventDefault();
+    const email = emailInput.value.trim();
+    if (!email) {
+      showError("Wpisz najpierw email, na który ma być wysłany link resetujący.");
+      emailInput.focus();
+      return;
+    }
+    try {
+      await sendPasswordResetEmail(auth, email);
+      showInfo(`Wysłano link resetujący hasło na adres ${email}. Sprawdź skrzynkę.`);
+    } catch (error) {
+      showError(authMessage(error.code));
+    }
+  });
+}
+
+// === Auth state observer ===
 onAuthStateChanged(auth, (user) => {
   if (user) {
     document.body.classList.remove("auth-pending", "auth-locked");
@@ -205,6 +280,7 @@ onAuthStateChanged(auth, (user) => {
     if (screen) screen.style.display = "none";
     addLogout(user);
     startFirestoreSync(user);
+    console.log("✓ Zalogowano:", user.email);
   } else {
     stopFirestoreSync();
     document.body.classList.remove("auth-pending", "auth-ready");
